@@ -2,13 +2,9 @@ name: Salesforce Code Analyzer
 
 on:
   push:
-    branches:
-      - master
-      - main
+    branches: [ master, main ]
   pull_request:
-    branches:
-      - master
-      - main
+    branches: [ master, main ]
 
 jobs:
   code-analysis:
@@ -22,7 +18,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # ✅ Needed so SARIF can map to the commit
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -35,11 +31,9 @@ jobs:
           java-version: '11'
           distribution: 'zulu'
 
-      # ✅ Explicitly install Salesforce CLI
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli@latest
 
-      # ✅ Explicitly install Code Analyzer plugin
       - name: Install Salesforce Code Analyzer Plugin
         run: sf plugins install code-analyzer@latest
 
@@ -50,9 +44,8 @@ jobs:
           run-arguments: '--target "./" --view detail --output-file sfca_results.json'
           results-artifact-name: salesforce-code-analyzer-results
 
-      - name: Run Salesforce Code Analyzer Scan
-        run: |
-          sf code-analyzer run --output-file sfca_results.sarif
+      - name: Run Salesforce Code Analyzer Scan (SARIF)
+        run: sf code-analyzer run --output-file sfca_results.sarif
 
       - name: Upload SARIF file to GitHub
         uses: github/codeql-action/upload-sarif@v3
@@ -60,53 +53,64 @@ jobs:
           sarif_file: sfca_results.sarif
 
       - name: Check for high severity violations
-        if: ${{ steps.run-code-analyzer.outputs.num-sev1-violations > 0 }}
+        if: ${{ steps.run-code-analyzer.outputs['num-sev1-violations'] > 0 }}
         run: |
           echo "❌ Found high severity violations. Please fix before merging."
           exit 1
 
+      # ✅ PR'larda yorum yaz; push'ta atla
       - name: Post Code Analyzer results to PR
+        if: ${{ github.event_name == 'pull_request' }}
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const path = './sfca_results.sarif';
-
-            if (fs.existsSync(path)) {
-              const results = JSON.parse(fs.readFileSync(path, 'utf8'));
-              let message = "### 🔎 Salesforce Code Analyzer Results\n\n";
-
-              const runs = results.runs || [];
-              let count = 0;
-
-              runs.forEach(run => {
-                (run.results || []).forEach(r => {
-                  const rule = r.ruleId || "Unknown Rule";
-                  const severity = r.level || "warning";
-                  const location = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || "Unknown file";
-                  const line = r.locations?.[0]?.physicalLocation?.region?.startLine || "?";
-
-                  if (count === 0) {
-                    message += "| Severity | Rule | File | Line |\n";
-                    message += "|----------|------|------|------|\n";
-                  }
-
-                  message += `| ${severity} | ${rule} | ${location} | ${line} |\n`;
-                  count++;
-                });
-              });
-
-              if (count === 0) {
-                message += "✅ No violations found.";
-              }
-
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: message
-              });
-            } else {
-              console.log("sfca_results.sarif not found.");
+            if (!fs.existsSync(path)) {
+              core.notice('sfca_results.sarif not found. Skipping comment.');
+              return;
             }
+            const results = JSON.parse(fs.readFileSync(path, 'utf8'));
+            let message = "### 🔎 Salesforce Code Analyzer Results\n\n";
+            const runs = results.runs || [];
+            let count = 0;
+            for (const run of runs) {
+              for (const r of (run.results || [])) {
+                const rule = r.ruleId || "Unknown Rule";
+                const severity = r.level || "warning";
+                const location = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || "Unknown file";
+                const line = r.locations?.[0]?.physicalLocation?.region?.startLine || "?";
+                if (count === 0) {
+                  message += "| Severity | Rule | File | Line |\n";
+                  message += "|----------|------|------|------|\n";
+                }
+                message += `| ${severity} | ${rule} | ${location} | ${line} |\n`;
+                count++;
+              }
+            }
+            if (count === 0) {
+              message += "✅ No violations found.";
+            }
+            // PR numarasını güvenli şekilde al
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) {
+              core.notice('No pull_request context. Skipping PR comment.');
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: message
+            });
+
+      # ✅ Push tetiklerinde sonuçları Job Summary'e yaz
+      - name: Add results to job summary (push only)
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          if [ -f sfca_results.sarif ]; then
+            node -e "const fs=require('fs');const r=JSON.parse(fs.readFileSync('sfca_results.sarif','utf8'));let m='### 🔎 Salesforce Code Analyzer Results (push)\\n\\n';let c=0;for(const run of (r.runs||[])){for(const x of (run.results||[])){const rule=x.ruleId||'Unknown Rule';const sev=x.level||'warning';const loc=x.locations?.[0]?.physicalLocation?.artifactLocation?.uri||'Unknown file';const line=x.locations?.[0]?.physicalLocation?.region?.startLine||'?';if(c===0){m+='| Severity | Rule | File | Line |\\n|----------|------|------|------|\\n';}m+=`| ${sev} | ${rule} | ${loc} | ${line} |\\n`;c++;}}if(c===0){m+='✅ No violations found.'}fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,m)"
+          else
+            echo "sfca_results.sarif not found." >> $GITHUB_STEP_SUMMARY
+          fi
